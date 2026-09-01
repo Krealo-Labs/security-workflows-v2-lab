@@ -1,0 +1,301 @@
+# =============================================================================
+# security-scan-v2.yml
+#
+# Version:  v2.0.0 + PASADA DE INSTRUMENTACION DE LABORATORIO
+# Origen:   https://github.com/Krealo-Labs/security-workflows-v2
+#
+# !! COPIA MODIFICADA - NO REPRESENTA LA PLANTILLA PUBLICADA !!
+# Incluye un step adicional de TruffleHog con --results=verified,unknown,
+# unverified, que existe unicamente para comprobar que la generacion de
+# SARIF funciona usando credenciales ficticias. La plantilla publicada
+# conserva --only-verified. NO copiar este archivo a un repositorio real.
+#
+# Esta es una copia. No recibe correcciones automaticamente: compara esta
+# version con la ultima release publicada en el repositorio de origen para
+# saber si hay cambios pendientes de incorporar.
+#
+# No edites este archivo para cambiar el comportamiento del escaneo: usa los
+# inputs desde el workflow que lo invoca (ver README).
+# =============================================================================
+
+name: Security Scan v2
+
+on:
+  workflow_call:
+    inputs:
+      block_on_secrets:
+        description: 'Bloquear el PR si TruffleHog detecta secretos'
+        type: boolean
+        required: false
+        default: true
+      block_on_container_misconfig:
+        description: 'Bloquear el PR si Trivy detecta misconfigurations críticas en IaC o contenedores'
+        type: boolean
+        required: false
+        default: true
+      block_on_dependencies:
+        description: 'Bloquear el PR si Trivy detecta dependencias con vulnerabilidades conocidas'
+        type: boolean
+        required: false
+        default: true
+      block_on_sast:
+        description: 'Bloquear el PR si Semgrep detecta vulnerabilidades'
+        type: boolean
+        required: false
+        default: false
+      trivy_scan_path:
+        description: 'Directorio con el código de IaC/Dockerfiles a escanear con Trivy'
+        type: string
+        required: false
+        default: '.'
+      enable_sarif_upload:
+        description: 'Habilitar subida de resultados SARIF a GitHub Security Tab'
+        type: boolean
+        required: false
+        default: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  secrets-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Se invoca el CLI directamente en vez de la Action del Marketplace: su action.yml
+      # fija --github-actions, que tiene prioridad sobre --sarif en el selector de printer
+      # de TruffleHog, y el CLI no expone ningun flag --output. Ver ADR-015.
+      - name: TruffleHog - Scan for secrets
+        continue-on-error: ${{ !inputs.block_on_secrets }}
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          docker run --rm -v .:/tmp -w /tmp \
+            ghcr.io/trufflesecurity/trufflehog:3.97.0 \
+            git file:///tmp/ \
+            --since-commit "${BASE_SHA}" \
+            --branch "${HEAD_SHA}" \
+            --only-verified \
+            --fail \
+            --no-update \
+            --sarif \
+            > trufflehog-results.sarif
+
+      # ---- INSTRUMENTACION DE LABORATORIO - NO EXISTE EN LA PLANTILLA ----
+      # --only-verified solo reporta credenciales confirmadas como vivas contra
+      # el proveedor, asi que una credencial ficticia nunca se reporta. Esta
+      # pasada usa --results para incluir tambien lo no verificado y poder
+      # comprobar que el comando genera un SARIF con hallazgos reales.
+      # No lleva --fail: es instrumentacion, no debe alterar el bloqueo.
+      - name: TruffleHog - LAB - Scan including unverified results
+        continue-on-error: true
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          docker run --rm -v .:/tmp -w /tmp \
+            ghcr.io/trufflesecurity/trufflehog:3.97.0 \
+            git file:///tmp/ \
+            --since-commit "${BASE_SHA}" \
+            --branch "${HEAD_SHA}" \
+            --results=verified,unknown,unverified \
+            --no-update \
+            --sarif \
+            > trufflehog-unverified-results.sarif
+
+      - name: LAB - Inspect generated SARIF files
+        if: always()
+        run: |
+          for f in trufflehog-results.sarif trufflehog-unverified-results.sarif; do
+            echo "=============================================="
+            echo "Archivo: ${f}"
+            if [ -f "${f}" ]; then
+              echo "Tamano: $(wc -c < "${f}") bytes"
+              echo "Contenido:"
+              cat "${f}"
+            else
+              echo "NO EXISTE"
+            fi
+            echo ""
+          done
+      # ---- FIN DE LA INSTRUMENTACION DE LABORATORIO ----
+
+      - name: Upload TruffleHog SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trufflehog-sarif
+          path: trufflehog-results.sarif
+          retention-days: 7
+
+      - name: Upload TruffleHog LAB SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trufflehog-unverified-sarif
+          path: trufflehog-unverified-results.sarif
+          retention-days: 7
+
+  container-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Acotar trivy_scan_path deja archivos de IaC fuera del analisis sin que nada
+      # lo indique. Se emite una anotacion visible en el PR para que la reduccion de
+      # cobertura sea explicita y no un hueco silencioso.
+      - name: Warn if IaC scan path is narrowed
+        if: inputs.trivy_scan_path != '.'
+        env:
+          SCAN_PATH: ${{ inputs.trivy_scan_path }}
+        run: |
+          echo "::warning title=Cobertura de IaC reducida::El escaneo esta acotado a '${SCAN_PATH}'. Los archivos de Terraform, CloudFormation, Kubernetes o Dockerfiles ubicados fuera de esa ruta NO se estan analizando. El valor recomendado es '.' (todo el repositorio)."
+
+      - name: Trivy - Scan IaC and Containers
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: ${{ !inputs.block_on_container_misconfig }}
+        with:
+          scan-type: 'config'
+          scan-ref: ${{ inputs.trivy_scan_path }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          # Sin esto, el SARIF ignora el filtro de 'severity' y sube tambien
+          # LOW/MEDIUM/UNKNOWN al Security Tab. Ver ADR-012.
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-sarif
+          path: trivy-results.sarif
+          retention-days: 7
+
+  # 'config' (job anterior) y 'fs' son complementarios, no alternativos: config evalua
+  # archivos de IaC y Dockerfiles contra reglas de configuracion, mientras que fs abre
+  # los lockfiles y busca CVEs en las dependencias. Ver ADR-016.
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy - Scan dependencies for known CVEs
+        uses: aquasecurity/trivy-action@v0.36.0
+        continue-on-error: ${{ !inputs.block_on_dependencies }}
+        with:
+          scan-type: 'fs'
+          # Siempre el repositorio completo: los lockfiles pueden vivir en cualquier
+          # carpeta y acotarlos no aporta velocidad significativa. No se reutiliza
+          # trivy_scan_path, que apunta al codigo de infraestructura.
+          scan-ref: '.'
+          scanners: 'vuln'
+          format: 'sarif'
+          output: 'trivy-deps-results.sarif'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy dependencies SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: trivy-deps-sarif
+          path: trivy-deps-results.sarif
+          retention-days: 7
+
+  sast-scan:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.173.0
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --error es imprescindible: sin el, 'semgrep scan' devuelve exit 0 aunque
+      # encuentre hallazgos, y block_on_sast no bloquearia nunca. Ver ADR-003.
+      - name: Semgrep CE - Scan for OWASP Top 10 vulnerabilities
+        continue-on-error: ${{ !inputs.block_on_sast }}
+        run: semgrep scan --config p/owasp-top-ten --sarif --output=semgrep-results.sarif --metrics=off --error
+
+      - name: Upload Semgrep SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: semgrep-sarif
+          path: semgrep-results.sarif
+          retention-days: 7
+
+  upload-sarif:
+    name: Upload SARIF to GitHub Security Tab
+    runs-on: ubuntu-latest
+    needs: [secrets-scan, container-scan, dependency-scan, sast-scan]
+    # En un PR desde un fork, GitHub degrada el token a solo lectura y sin secretos,
+    # asi que security-events: write es inalcanzable y la subida fallaria siempre.
+    # Se omite el job en ese caso para no mostrar un check rojo enganoso: los tres
+    # escaneos igual corren y sus resultados quedan en los logs. Ver ADR-012.
+    if: >-
+      ${{ always() && inputs.enable_sarif_upload
+      && (github.event_name != 'pull_request'
+      || github.event.pull_request.head.repo.full_name == github.repository) }}
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      # Necesario aunque este job no escanee nada: upload-sarif usa checkout_path
+      # (default github.workspace) para convertir las rutas absolutas del SARIF en
+      # rutas relativas y poder enlazar cada hallazgo con su linea de codigo.
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all SARIF artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: '*-sarif'
+          path: sarif-results
+
+      - name: Upload TruffleHog SARIF to Security Tab
+        if: hashFiles('sarif-results/trufflehog-sarif/trufflehog-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results/trufflehog-sarif/trufflehog-results.sarif
+          category: secrets
+
+      # ---- INSTRUMENTACION DE LABORATORIO - NO EXISTE EN LA PLANTILLA ----
+      - name: LAB - Upload TruffleHog unverified SARIF to Security Tab
+        if: hashFiles('sarif-results/trufflehog-unverified-sarif/trufflehog-unverified-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results/trufflehog-unverified-sarif/trufflehog-unverified-results.sarif
+          category: secrets-unverified
+      # ---- FIN DE LA INSTRUMENTACION DE LABORATORIO ----
+
+      - name: Upload Trivy SARIF to Security Tab
+        if: hashFiles('sarif-results/trivy-sarif/trivy-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results/trivy-sarif/trivy-results.sarif
+          category: container-iac
+
+      - name: Upload Trivy dependencies SARIF to Security Tab
+        if: hashFiles('sarif-results/trivy-deps-sarif/trivy-deps-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results/trivy-deps-sarif/trivy-deps-results.sarif
+          category: dependencies
+
+      - name: Upload Semgrep SARIF to Security Tab
+        if: hashFiles('sarif-results/semgrep-sarif/semgrep-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: sarif-results/semgrep-sarif/semgrep-results.sarif
+          category: sast

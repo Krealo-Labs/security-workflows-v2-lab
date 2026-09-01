@@ -1,0 +1,13 @@
+name: Security Pipeline
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  security-check:
+    permissions:
+      contents: read
+      security-events: write
+    uses: ./.github/workflows/security-scan-v2.yml
