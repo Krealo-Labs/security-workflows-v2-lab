@@ -1,7 +1,7 @@
 # =============================================================================
 # security-scan-v2.yml
 #
-# Version:  v2.1.0 + PASADA DE INSTRUMENTACION DE LABORATORIO
+# Version:  v2.2.0 + PASADA DE INSTRUMENTACION DE LABORATORIO
 # Origen:   https://github.com/Krealo-Labs/security-workflows-v2
 #
 # !! COPIA MODIFICADA - NO REPRESENTA LA PLANTILLA PUBLICADA !!
@@ -51,6 +51,13 @@ on:
         type: string
         required: false
         default: '.'
+      # Solo gobierna el BLOQUEO. El SARIF se publica siempre con todas las
+      # severidades (ver ADR-023). Valores: UNKNOWN, LOW, MEDIUM, HIGH, CRITICAL.
+      trivy_block_severity:
+        description: 'Severidades de Trivy que bloquean el PR. No afecta lo que se publica en SARIF.'
+        type: string
+        required: false
+        default: 'CRITICAL,HIGH'
       enable_sarif_upload:
         description: 'Habilitar subida de resultados SARIF a GitHub Security Tab'
         type: boolean
@@ -97,17 +104,17 @@ jobs:
             git file:///tmp/ \
             --since-commit "${BASE_SHA}" \
             --branch "${HEAD_SHA}" \
-            --only-verified \
+            --results=verified,unknown \
             --no-update \
             ${FAIL_FLAG} \
             --sarif \
             > trufflehog-results.sarif
 
       # ---- INSTRUMENTACION DE LABORATORIO - NO EXISTE EN LA PLANTILLA ----
-      # --only-verified solo reporta credenciales confirmadas como vivas contra
-      # el proveedor, asi que una credencial ficticia nunca se reporta. Esta
-      # pasada usa --results para incluir tambien lo no verificado y poder
-      # comprobar que el comando genera un SARIF con hallazgos reales.
+      # Desde v2.2.0 la plantilla usa --results=verified,unknown, que ya deberia
+      # detectar el fixture de credenciales. Esta pasada agrega ademas
+      # unverified para MEDIR el suelo de ruido: cuantos hallazgos extra
+      # entrarian si no lo excluyeramos. Es el dato que respalda el ADR-024.
       # No lleva --fail: es instrumentacion, no debe alterar el bloqueo.
       - name: TruffleHog - LAB - Scan including unverified results
         continue-on-error: true
@@ -185,10 +192,10 @@ jobs:
           # case() es la funcion condicional documentada por GitHub; si no se debe
           # bloquear, Trivy termina con 0 y el SARIF se genera igual.
           exit-code: ${{ case(inputs.block_on_container_misconfig, '1', '0') }}
-          severity: 'CRITICAL,HIGH'
-          # Sin esto, el SARIF ignora el filtro de 'severity' y sube tambien
-          # LOW/MEDIUM/UNKNOWN al Security Tab. Ver ADR-012.
-          limit-severities-for-sarif: true
+          # Solo decide que cuenta para el exit-code. Ver ADR-023.
+          severity: ${{ inputs.trivy_block_severity }}
+          # NO se usa 'limit-severities-for-sarif': su default (false) publica el
+          # SARIF con TODAS las severidades, que es justo lo que queremos.
 
       - name: Upload Trivy SARIF artifact
         if: always()
@@ -220,8 +227,8 @@ jobs:
           output: 'trivy-deps-results.sarif'
           # Ver ADR-021, igual que en container-scan.
           exit-code: ${{ case(inputs.block_on_dependencies, '1', '0') }}
-          severity: 'CRITICAL,HIGH'
-          limit-severities-for-sarif: true
+          # Solo decide que cuenta para el exit-code. Ver ADR-023.
+          severity: ${{ inputs.trivy_block_severity }}
 
       - name: Upload Trivy dependencies SARIF artifact
         if: always()
@@ -252,6 +259,7 @@ jobs:
           fi
           semgrep scan \
             --config p/owasp-top-ten \
+            --config p/security-audit \
             --sarif \
             --output=semgrep-results.sarif \
             --metrics=off \
