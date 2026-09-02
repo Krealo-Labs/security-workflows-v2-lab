@@ -8,6 +8,7 @@ on:
 jobs:
   security-check:
     permissions:
+      actions: read
       contents: read
       security-events: write
     uses: ./.github/workflows/security-scan-v2.yml
